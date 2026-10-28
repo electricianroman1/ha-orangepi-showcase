@@ -1,0 +1,6 @@
+secrets.yaml
+.env
+*.bak*
+backups/
+*.tar
+__pycache__/

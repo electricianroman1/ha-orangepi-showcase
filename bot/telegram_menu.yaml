@@ -1,0 +1,951 @@
+# Telegram-бот «Умный дом»: меню /menu с кнопками и уведомления.
+# Провайдер рвёт часть соединений с api.telegram.org, поэтому отправка идёт через
+# script.tg_send: до 3 попыток, успех подтверждается событием tg_sent.
+# Два пользователя: админ (tg_chat_id) видит всё; остальные разрешённые чаты — только бытовые
+# разделы без тёплого пола и только уведомления о протечке и напоминание про воду.
+# Новый чат нужно ещё добавить в «Разрешённые чаты» интеграции Telegram, иначе бот его не слышит.
+telegram_menu:
+  utility_meter:
+    water_cold_day:
+      name: "Холодная вода за сегодня"
+      source: sensor.voda_kholodnaia
+      cycle: daily
+    water_cold_month:
+      name: "Холодная вода за месяц"
+      source: sensor.voda_kholodnaia
+      cycle: monthly
+    water_hot_day:
+      name: "Горячая вода за сегодня"
+      source: sensor.voda_goriachaia
+      cycle: daily
+    water_hot_month:
+      name: "Горячая вода за месяц"
+      source: sensor.voda_goriachaia
+      cycle: monthly
+
+  # Большой ПК (LLM): будим по Wake-on-LAN, состояние — по ping
+  wake_on_lan:
+
+  command_line:
+    - binary_sensor:
+        name: "Компьютер (LLM) в сети"
+        unique_id: pc_llm_online
+        command: "ping -c 1 -W 1 192.168.1.50 >/dev/null && echo ON || echo OFF"
+        scan_interval: 30
+        device_class: connectivity
+
+  logger:
+    default: warning
+    logs:
+      # rest_command пишет полный URL при ошибке, а в URL токен бота — не пускаем это в журнал
+      homeassistant.components.rest_command: error
+
+  rest_command:
+    # Прямой вызов Bot API — нужен для кнопок «копировать» (copy_text), которых нет в telegram_bot HA
+    tg_api:
+      url: !secret tg_api_url
+      method: post
+      content_type: "application/json"
+      timeout: 15
+      payload: "{{ body }}"
+
+  script:
+    tg_api_call:
+      alias: "Telegram: прямой вызов Bot API с повтором"
+      mode: parallel
+      max: 20
+      fields:
+        method: {}
+        body: {}
+      sequence:
+        - repeat:
+            sequence:
+              - action: rest_command.tg_api
+                data:
+                  method: "{{ method }}"
+                  body: "{{ body | to_json }}"
+                response_variable: resp
+                continue_on_error: true
+            until: "{{ (resp is defined and resp.status | default(0) == 200) or repeat.index >= 3 }}"
+
+    tg_send_once:
+      alias: "Telegram: одна попытка отправки"
+      mode: parallel
+      max: 20
+      fields:
+        message: {}
+        keyboard: {}
+        edit_id: {}
+        token: {}
+        chat: {}
+      sequence:
+        - if: "{{ edit_id | int(0) > 0 }}"
+          then:
+            - action: telegram_bot.edit_message
+              data:
+                chat_id: "{{ chat | int }}"
+                message_id: "{{ edit_id | int }}"
+                message: "{{ message }}"
+                parse_mode: html
+                inline_keyboard: "{{ keyboard if keyboard else [] }}"
+          else:
+            - action: telegram_bot.send_message
+              data:
+                chat_id: "{{ chat | int }}"
+                message: "{{ message }}"
+                parse_mode: html
+                inline_keyboard: "{{ keyboard if keyboard else [] }}"
+        - event: tg_sent
+          event_data:
+            token: "{{ token }}"
+
+    tg_send:
+      alias: "Telegram: отправить с повтором"
+      mode: parallel
+      max: 20
+      fields:
+        message: {}
+        keyboard: {}
+        edit_id: {}
+        chat:
+          description: "Кому отправить; по умолчанию — админу"
+      sequence:
+        - variables:
+            token: "{{ now().timestamp() }}-{{ range(100000) | random }}"
+            admin_chat: !secret tg_chat_id
+            to_chat: "{{ chat if chat is defined and chat | int(0) != 0 else admin_chat }}"
+        - repeat:
+            sequence:
+              - action: script.turn_on
+                target:
+                  entity_id: script.tg_send_once
+                data:
+                  variables:
+                    message: "{{ message }}"
+                    keyboard: "{{ keyboard if keyboard is defined else [] }}"
+                    edit_id: "{{ edit_id | default(0) }}"
+                    token: "{{ token }}"
+                    chat: "{{ to_chat }}"
+              - wait_for_trigger:
+                  - trigger: event
+                    event_type: tg_sent
+                    event_data:
+                      token: "{{ token }}"
+                timeout: 30
+                continue_on_timeout: true
+              # Провайдер молча рвёт простаивающие соединения, и клиент бота зависает на мёртвом
+              # соединении (TimedOut на каждой отправке). Две неудачи подряд — перезапускаем бота.
+              - if: "{{ wait.trigger is none and repeat.index == 2 }}"
+                then:
+                  - action: homeassistant.reload_config_entry
+                    data:
+                      entry_id: 01JZNXAFGDD3H9QZR3PPZBJ6R0
+                    continue_on_error: true
+                  - delay: 5
+            until: "{{ wait.trigger is not none or repeat.index >= 3 }}"
+
+    pc_wake_notify:
+      alias: "Компьютер: сообщить, когда проснётся"
+      mode: single
+      sequence:
+        - wait_template: "{{ is_state('binary_sensor.kompiuter_llm_v_seti', 'on') }}"
+          timeout: "00:03:00"
+          continue_on_timeout: true
+        - action: script.tg_send
+          data:
+            message: >-
+              {{ '🖥 Компьютер включился. LLM-бот ответит примерно через минуту.' if wait.completed else
+                 '⚠️ Компьютер не включился за 3 минуты. Проверьте, что он в сети и Wake-on-LAN включён в BIOS.' }}
+
+    tg_answer:
+      alias: "Telegram: ответ на нажатие кнопки"
+      mode: parallel
+      max: 20
+      fields:
+        callback_id: {}
+      sequence:
+        - action: telegram_bot.answer_callback_query
+          data:
+            callback_query_id: "{{ callback_id }}"
+            message: "OK"
+
+    # Картинка-график: данные из истории HA → /config/tg/tg_chart.py рисует PNG → отправка фото.
+    # Папка /config/tg/media должна быть в allowlist_external_dirs (configuration.yaml).
+    tg_chart:
+      alias: "Telegram: прислать график"
+      mode: queued
+      max: 3
+      fields:
+        kind:
+          description: "temp — температура за сутки, water — вода по дням"
+        chat: {}
+      sequence:
+        - variables:
+            admin_chat: !secret tg_chat_id
+            to_chat: "{{ chat if chat is defined and chat | int(0) != 0 else admin_chat }}"
+            tz: "{{ now().utcoffset().total_seconds() | int }}"
+            chart_rooms:
+              - ["Кабинет", sensor.datchik_tepmeratury_s_ekranom_bolshoi_temperature]
+              - ["Спальня", sensor.miaomiaoce_t2_xxxx_temperature]
+              - ["Прихожая", sensor.miaomiaoce_t2_xxxx_temperature]
+              - ["Гостиная", sensor.air_conditioner_ambient_temperature]
+              - ["Кухня", sensor.datchik_na_kukhne_temperature]
+            chart_outside:
+              - ["Улица", sensor.temperatura_na_ulitse]
+              - ["Балкон", sensor.datchik_temperatury_sonof_temperature]
+        - if: "{{ kind == 'temp' }}"
+          then:
+            - action: recorder.get_statistics
+              data:
+                statistic_ids: "{{ (chart_rooms + chart_outside) | map(attribute=1) | list }}"
+                start_time: "{{ (now() - timedelta(hours=24)).isoformat() }}"
+                period: 5minute
+                types: [mean]
+              response_variable: st
+            - variables:
+                payload: >-
+                  {% set ns = namespace(rooms=[], outside=[]) %}
+                  {% for group in ['rooms', 'outside'] %}
+                    {% for name, sid in (chart_rooms if group == 'rooms' else chart_outside) %}
+                      {% set p = namespace(v=[]) %}
+                      {% for x in st.statistics.get(sid, []) if x.mean is not none %}
+                        {% set p.v = p.v + [[as_timestamp(x.start) | int, x.mean | round(2)]] %}
+                      {% endfor %}
+                      {% if group == 'rooms' %}{% set ns.rooms = ns.rooms + [[name, p.v]] %}
+                      {% else %}{% set ns.outside = ns.outside + [[name, p.v]] %}{% endif %}
+                    {% endfor %}
+                  {% endfor %}
+                  {{ {'tz': tz, 'rooms': ns.rooms, 'outside': ns.outside} | to_json }}
+                caption: "🌡 Температура за сутки"
+          else:
+            # Вода: дневной расход за прошлый и текущий месяц (для сравнения)
+            - action: recorder.get_statistics
+              data:
+                statistic_ids: [sensor.voda_kholodnaia, sensor.voda_goriachaia]
+                start_time: >-
+                  {{ (now().replace(day=1) - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat() }}
+                period: day
+                types: [change]
+              response_variable: st
+            - variables:
+                payload: >-
+                  {% set ns = namespace(cold=[], hot=[]) %}
+                  {% for x in st.statistics.get('sensor.voda_kholodnaia', []) if x.change is not none %}
+                    {% set ns.cold = ns.cold + [[as_timestamp(x.start) | int, x.change | round(4)]] %}
+                  {% endfor %}
+                  {% for x in st.statistics.get('sensor.voda_goriachaia', []) if x.change is not none %}
+                    {% set ns.hot = ns.hot + [[as_timestamp(x.start) | int, x.change | round(4)]] %}
+                  {% endfor %}
+                  {{ {'tz': tz, 'cold': ns.cold, 'hot': ns.hot} | to_json }}
+                caption: "📊 Вода по дням"
+        - action: shell_command.tg_chart
+          data:
+            kind: "{{ kind }}"
+            payload: "{{ payload if payload is string else payload | to_json }}"
+          response_variable: out
+        - condition: template
+          value_template: "{{ out.returncode == 0 }}"
+        # Одна попытка + одна повторная после переподключения. Без repeat: переменная ответа
+        # внутри repeat не видна в until, и цикл не останавливался (23.10 — слал фото по кругу).
+        - action: telegram_bot.send_photo
+          data:
+            chat_id: "{{ to_chat | int }}"
+            file: "{{ out.stdout | trim }}"
+            caption: "{{ caption }}"
+          continue_on_error: true
+          response_variable: sent
+        - if: "{{ sent is not defined or not sent }}"
+          then:
+            # клиент бота мог зависнуть на мёртвом соединении — как в tg_send, переподключаем
+            - action: homeassistant.reload_config_entry
+              data:
+                entry_id: 01JZNXAFGDD3H9QZR3PPZBJ6R0
+              continue_on_error: true
+            - delay: 5
+            - action: telegram_bot.send_photo
+              data:
+                chat_id: "{{ to_chat | int }}"
+                file: "{{ out.stdout | trim }}"
+                caption: "{{ caption }}"
+              continue_on_error: true
+
+  shell_command:
+    tg_chart: "python3 /config/tg/tg_chart.py {{ kind }} '{{ payload }}'"
+
+  automation:
+    - id: tg_menu
+      alias: "Telegram: меню управления"
+      mode: queued
+      max: 10
+      triggers:
+        # Любая команда (/menu, /water, /temp, /lights ... из кнопки «Меню»); незнакомая — главный экран
+        - trigger: event
+          event_type: telegram_command
+          id: cmd
+        - trigger: event
+          event_type: telegram_callback
+          id: cb
+        # Нажатие кнопки постоянной панели под полем ввода приходит обычным текстом
+        - trigger: event
+          event_type: telegram_text
+          id: txt
+      variables:
+        admin_chat: !secret tg_chat_id
+        chat_id: "{{ trigger.event.data.chat_id | int(0) or admin_chat }}"
+        is_admin: "{{ chat_id | int == admin_chat | int }}"
+        # Разделы только для админа: команду не выполняем, показываем главное меню
+        admin_only: ["/fl", "/pc", "/rem"]
+        # Постоянная панель: строки кнопок и какой раздел открывает каждая
+        panel_rows: >-
+          {{ [['💧 Вода', '🌡 Температура'], ['💡 Свет', '❄️ Кондиционер']]
+             + ([['🔥 Тёплый пол', '📺 Телевизор'], ['🖥 Компьютер', '🏠 Меню']] if is_admin
+                else [['📺 Телевизор', '🏠 Меню']]) }}
+        panel_cmds:
+          "💧 Вода": /water
+          "🌡 Температура": /temp
+          "💡 Свет": /lights
+          "❄️ Кондиционер": /ac
+          "🔥 Тёплый пол": /fl
+          "📺 Телевизор": /tv
+          "🖥 Компьютер": /pc
+          "🏠 Меню": /menu
+        data: >-
+          {% if trigger.id == 'cb' %}{{ trigger.event.data.data }}
+          {%- elif trigger.id == 'txt' %}{{ panel_cmds.get(trigger.event.data.text | trim, '') }}
+          {%- else %}{{ trigger.event.data.command }}{% endif %}
+        raw_cmd: "{{ data.split('_')[0] }}"
+        cmd: "{{ '/menu' if not is_admin and raw_cmd in admin_only else raw_cmd }}"
+        arg: "{{ data.split('_')[1] if '_' in data and cmd == raw_cmd else '' }}"
+        msg_id: "{{ trigger.event.data.message.message_id if trigger.id == 'cb' else 0 }}"
+        # [сущность, подпись на кнопке, комната]; индекс в списке — аргумент кнопки /lt_N
+        lights:
+          - [switch.0x00158d0000000001, "Кабинет", "🖥 Кабинет"]
+          - [switch.liustra_v_gostinoi, "Люстра", "🛋 Гостиная"]
+          - [light.svet_v_spalne, "Спальня", "🛏 Спальня"]
+          - [switch.podsvetka_kukhni, "Подсветка кухни", "🍳 Кухня"]
+          - [switch.0x00158d0000000002_l1, "Прихожая", "🚪 Прихожая и коридор"]
+          - [switch.0x00158d0000000002_l2, "Коридор", "🚪 Прихожая и коридор"]
+          - [switch.nizhnii, "Нижний свет", "✨ Другое"]
+          - [switch.nizhnii_sprava, "Нижний справа", "✨ Другое"]
+          - [switch.0x00158d0000000003_l1, "Ванная L1", "🛁 Ванная и туалет"]
+          - [switch.0x00158d0000000003_l2, "Ванная L2", "🛁 Ванная и туалет"]
+          - [switch.tualet_l2, "Туалет", "🛁 Ванная и туалет"]
+          - [light.svetilnik_2, "Светильник", "✨ Другое"]
+          - [switch.balkon, "Балкон", "🌿 Балкон"]
+        # [название, температура, влажность] — экран «Температура» и сводка
+        rooms:
+          - ["🖥 Кабинет", sensor.datchik_tepmeratury_s_ekranom_bolshoi_temperature, sensor.datchik_tepmeratury_s_ekranom_bolshoi_humidity]
+          - ["🛏 Спальня", sensor.miaomiaoce_t2_xxxx_temperature, sensor.miaomiaoce_t2_xxxx_relative_humidity]
+          - ["🚪 Прихожая", sensor.miaomiaoce_t2_xxxx_temperature, sensor.miaomiaoce_t2_xxxx_relative_humidity]
+          - ["🛋 Гостиная", sensor.air_conditioner_ambient_temperature, null]
+          - ["🍳 Кухня", sensor.datchik_na_kukhne_temperature, sensor.datchik_na_kukhne_humidity]
+        line: "━━━━━━━━━━━━━━━"
+        ac: climate.air_conditioner_air_conditioner
+        floor: climate.0x00158d0000000004
+        tv: media_player.haier_android_tv_ff_pro_2
+        back: "⬅️ Меню:/menu"
+      actions:
+        # Произвольный текст (не кнопка панели) — не наш
+        - condition: template
+          value_template: "{{ data != '' }}"
+        # /start и /panel — прислать постоянную панель кнопок
+        - if: "{{ trigger.id == 'cmd' and data in ['/start', '/panel'] }}"
+          then:
+            - action: script.tg_api_call
+              data:
+                method: sendMessage
+                body:
+                  chat_id: "{{ chat_id }}"
+                  text: "⌨️ Кнопки разделов — внизу, под полем ввода. Если пропадут, отправьте /panel."
+                  reply_markup:
+                    keyboard: >-
+                      {% set ns = namespace(rows=[]) %}
+                      {% for row in panel_rows %}
+                        {% set r = namespace(btns=[]) %}
+                        {% for t in row %}{% set r.btns = r.btns + [{'text': t}] %}{% endfor %}
+                        {% set ns.rows = ns.rows + [r.btns] %}
+                      {% endfor %}
+                      {{ ns.rows }}
+                    resize_keyboard: true
+                    is_persistent: true
+        - if: "{{ trigger.id == 'cb' }}"
+          then:
+            - action: script.turn_on
+              target:
+                entity_id: script.tg_answer
+              data:
+                variables:
+                  callback_id: "{{ trigger.event.data.id }}"
+
+        # 1. Действие по кнопке
+        - choose:
+            - conditions: "{{ cmd == '/lt' }}"
+              sequence:
+                - action: homeassistant.toggle
+                  target:
+                    entity_id: "{{ lights[arg | int][0] }}"
+            - conditions: "{{ cmd == '/alloff' }}"
+              sequence:
+                - action: homeassistant.turn_off
+                  target:
+                    entity_id: "{{ lights | map(attribute=0) | select('is_state', 'on') | list }}"
+                  continue_on_error: true
+            - conditions: "{{ cmd == '/ac' and arg == 'off' }}"
+              sequence:
+                - action: climate.turn_off
+                  target: { entity_id: "{{ ac }}" }
+            - conditions: "{{ cmd == '/ac' and arg in ['cool', 'heat'] }}"
+              sequence:
+                - action: climate.set_hvac_mode
+                  target: { entity_id: "{{ ac }}" }
+                  data: { hvac_mode: "{{ arg }}" }
+            - conditions: "{{ cmd == '/ac' and arg in ['up', 'down'] }}"
+              sequence:
+                - action: climate.set_temperature
+                  target: { entity_id: "{{ ac }}" }
+                  data:
+                    temperature: >-
+                      {% set t = state_attr(ac, 'temperature') | float(22) + (1 if arg == 'up' else -1) %}
+                      {{ [[t, 16] | max, 32] | min }}
+            - conditions: "{{ cmd == '/fl' and arg == 'off' }}"
+              sequence:
+                - action: climate.set_hvac_mode
+                  target: { entity_id: "{{ floor }}" }
+                  data: { hvac_mode: "off" }
+            - conditions: "{{ cmd == '/fl' and arg == 'on' }}"
+              sequence:
+                - action: climate.set_hvac_mode
+                  target: { entity_id: "{{ floor }}" }
+                  data: { hvac_mode: heat }
+            - conditions: "{{ cmd == '/fl' and arg in ['up', 'down'] }}"
+              sequence:
+                - action: climate.set_temperature
+                  target: { entity_id: "{{ floor }}" }
+                  data:
+                    temperature: >-
+                      {% set t = state_attr(floor, 'temperature') | float(32) + (1 if arg == 'up' else -1) %}
+                      {{ [[t, 20] | max, 35] | min }}
+            - conditions: "{{ cmd == '/tv' and arg == 'on' }}"
+              sequence:
+                - action: media_player.turn_on
+                  target: { entity_id: "{{ tv }}" }
+            - conditions: "{{ cmd == '/tv' and arg == 'off' }}"
+              sequence:
+                - action: media_player.turn_off
+                  target: { entity_id: "{{ tv }}" }
+            - conditions: "{{ cmd == '/tv' and arg == 'pc' }}"
+              sequence:
+                - action: script.tv_computer
+            - conditions: "{{ cmd == '/tv' and arg == 'home' }}"
+              sequence:
+                - action: script.tv_home
+            - conditions: "{{ cmd == '/pc' and arg == 'wake' }}"
+              sequence:
+                - action: wake_on_lan.send_magic_packet
+                  data:
+                    mac: "AA:BB:CC:DD:EE:FF"
+                    broadcast_address: 192.168.1.255
+                - if: "{{ is_state('binary_sensor.kompiuter_llm_v_seti', 'off') }}"
+                  then:
+                    - action: script.turn_on
+                      target:
+                        entity_id: script.pc_wake_notify
+            - conditions: "{{ cmd == '/chart' and arg in ['temp', 'water'] }}"
+              sequence:
+                - action: script.turn_on
+                  target:
+                    entity_id: script.tg_chart
+                  data:
+                    variables:
+                      kind: "{{ arg }}"
+                      chat: "{{ chat_id }}"
+            # Кнопки под напоминанием (сообщение «⏰ Напоминание\n<текст>»)
+            - conditions: "{{ cmd == '/rem' and trigger.id == 'cb' }}"
+              sequence:
+                - variables:
+                    rem_text: >-
+                      {% set lines = (trigger.event.data.message.text | default('')).split('\n') %}
+                      {{ lines[1] if lines | length > 1 else lines[0] }}
+                    snooze: "{{ {'snooze10': 10, 'snooze60': 60}.get(arg, 0) }}"
+                    until: "{{ (now() + timedelta(minutes=snooze | int)).strftime('%H:%M') }}"
+                - if: "{{ snooze | int > 0 }}"
+                  then:
+                    - action: calendar.create_event
+                      target: { entity_id: calendar.napominaniia }
+                      data:
+                        summary: "{{ rem_text }}"
+                        start_date_time: "{{ (now() + timedelta(minutes=snooze | int)).isoformat() }}"
+                        end_date_time: "{{ (now() + timedelta(minutes=snooze | int + 1)).isoformat() }}"
+                - action: telegram_bot.edit_message
+                  data:
+                    chat_id: "{{ chat_id | int }}"
+                    message_id: "{{ msg_id | int }}"
+                    parse_mode: html
+                    message: >-
+                      {{ ('⏰ Отложено до ' ~ until if snooze | int > 0 else '✅ Сделано') }}:
+                      {{ rem_text | e }}
+                  continue_on_error: true
+        - if: "{{ (arg != '' and cmd not in ['/chart', '/rem']) or cmd == '/alloff' }}"
+          then:
+            - delay: 2
+
+        # 2. Экран (график приходит отдельным фото, экран не перерисовываем)
+        - variables:
+            screen: >-
+              {{ {'/lt': 'lights', '/alloff': 'lights', '/lights': 'lights', '/ac': 'ac', '/fl': 'floor',
+                  '/tv': 'tv', '/water': 'water', '/temp': 'temp', '/pc': 'pc', '/chart': 'none',
+                  '/rem': 'none'}.get(cmd, 'menu') }}
+        - condition: template
+          value_template: "{{ screen != 'none' }}"
+        - choose:
+            - conditions: "{{ screen == 'water' }}"
+              sequence:
+                - variables:
+                    cold: "{{ states('sensor.voda_kholodnaia') }}"
+                    hot: "{{ states('sensor.voda_goriachaia') }}"
+                    text: |-
+                      💧 <b>Вода</b>
+                      {{ line }}
+                      🔵 <b>Холодная</b> — показание, м³
+                      👉 <code>{{ cold }}</code>
+                      ├ сегодня  <b>{{ states('sensor.kholodnaia_voda_za_segodnia') | float(0) | round(3) }}</b>
+                      └ за месяц <b>{{ states('sensor.kholodnaia_voda_za_mesiats') | float(0) | round(3) }}</b>
+
+                      🔴 <b>Горячая</b> — показание, м³
+                      👉 <code>{{ hot }}</code>
+                      ├ сегодня  <b>{{ states('sensor.goriachaia_voda_za_segodnia') | float(0) | round(3) }}</b>
+                      └ за месяц <b>{{ states('sensor.goriachaia_voda_za_mesiats') | float(0) | round(3) }}</b>
+                      {{ line }}
+                      📋 Нажмите на число или кнопку — показание скопируется.
+                      <i>Данные от контроллера: {{ (state_attr('sensor.saures_kontroller', 'readout_dt') or '—') | replace('T', ' ') }}</i>
+                    markup:
+                      inline_keyboard:
+                        - - text: "📋 Холодная {{ cold }}"
+                            copy_text: { text: "{{ cold }}" }
+                          - text: "📋 Горячая {{ hot }}"
+                            copy_text: { text: "{{ hot }}" }
+                        - - { text: "📊 Расход по дням", callback_data: "/chart_water" }
+                        - - { text: "🔄 Обновить", callback_data: "/water" }
+                          - { text: "⬅️ Меню", callback_data: "/menu" }
+                - action: script.tg_api_call
+                  data:
+                    method: "{{ 'editMessageText' if msg_id | int(0) > 0 else 'sendMessage' }}"
+                    body: >-
+                      {% set b = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML', 'reply_markup': markup} %}
+                      {{ dict(b, message_id=msg_id | int) if msg_id | int(0) > 0 else b }}
+            - conditions: "{{ screen == 'temp' }}"
+              sequence:
+                - action: script.tg_send
+                  data:
+                    edit_id: "{{ msg_id }}"
+                    chat: "{{ chat_id }}"
+                    keyboard: ["📈 График за сутки:/chart_temp", "🔄 Обновить:/temp, ⬅️ Меню:/menu"]
+                    message: |-
+                      {%- macro dot(t) -%}{{ '❔' if t is none else ('🔵' if t < 20 else ('🟢' if t <= 25 else '🔴')) }}{%- endmacro -%}
+                      {%- macro wet(h) -%}{{ 'сухо' if h < 40 else ('норма' if h <= 60 else 'влажно') }}{%- endmacro -%}
+                      🌡 <b>Температура</b>
+                      {{ line }}
+                      {%- for name, t, hum in rooms %}
+                      {%- set tv = states(t) | float(none) %}
+                      {%- set hv = states(hum) | float(none) if hum else none %}
+                      {{ dot(tv) }} <b>{{ name }}</b>  {{ tv if tv is not none else '—' }} °C
+                      {%- if hv is not none %} · 💧 {{ hv | round(0) | int }} % {{ wet(hv) }}{% endif %}
+                      {%- endfor %}
+                      {{ line }}
+                      🌳 Улица <b>{{ states('sensor.temperatura_na_ulitse') }} °C</b> · 🌿 Балкон <b>{{ states('sensor.datchik_temperatury_sonof_temperature') }} °C</b>
+                      {%- if is_admin %}
+                      🔥 Тёплый пол: {{ state_attr(floor, 'current_temperature') }} °C (уставка {{ state_attr(floor, 'temperature') }})
+                      {%- endif %}
+                      <i>🔵 прохладно · 🟢 комфортно 20–25 °C · 🔴 жарко
+                      💧 влажность: норма 40–60 %</i>
+            - conditions: "{{ screen == 'lights' }}"
+              sequence:
+                - action: script.tg_send
+                  data:
+                    edit_id: "{{ msg_id }}"
+                    chat: "{{ chat_id }}"
+                    message: |-
+                      {%- set dead = ['unavailable', 'unknown'] %}
+                      {%- set on = lights | selectattr(0, 'is_state', 'on') | list %}
+                      💡 <b>Свет</b>
+                      {{ line }}
+                      {{ '🟡 Горит: <b>' ~ (on | map(attribute=1) | join(', ')) ~ '</b>' if on else '🌙 Весь свет выключен' }}
+                      {%- for room in lights | map(attribute=2) | unique %}
+                      {%- set items = lights | selectattr(2, 'eq', room) | list %}
+                      {%- set shown = items if is_admin else items | selectattr(0, 'has_value') | list %}
+                      {%- if shown %}
+                      {{ room }}: {% for e, name, r in shown -%}
+                        {{ '💡' if states(e) == 'on' else ('⚠️' if states(e) in dead else '🌑') }} {{ name }}{{ ', ' if not loop.last }}
+                      {%- endfor %}
+                      {%- endif %}
+                      {%- endfor %}
+                      {{ line }}
+                      <i>💡 горит · 🌑 выключен{{ ' · ⚠️ не на связи' if is_admin }}</i>
+                      Нажмите кнопку, чтобы включить или выключить:
+                    keyboard: >-
+                      {% set dead = ['unavailable', 'unknown'] %}
+                      {% set ns = namespace(btn=[], rows=[]) %}
+                      {# горящие сверху, затем выключенные, недоступные — в конце и только админу #}
+                      {% for pass in ['on', 'off', 'dead'] %}
+                        {% for j in range(lights | length) %}
+                          {% set s = states(lights[j][0]) %}
+                          {% set grp = 'dead' if s in dead else ('on' if s == 'on' else 'off') %}
+                          {% if grp == pass and (grp != 'dead' or is_admin) %}
+                            {% set icon = {'on': '💡', 'off': '🌑', 'dead': '⚠️'}[grp] %}
+                            {% set ns.btn = ns.btn + [icon ~ ' ' ~ lights[j][1] ~ ':/lt_' ~ j] %}
+                          {% endif %}
+                        {% endfor %}
+                      {% endfor %}
+                      {% for i in range(0, ns.btn | length, 2) %}
+                        {% set ns.rows = ns.rows + [ns.btn[i:i + 2] | join(', ')] %}
+                      {% endfor %}
+                      {{ ns.rows + ['🌚 Выключить весь свет:/alloff', '🔄 Обновить:/lights, ' ~ back] }}
+            - conditions: "{{ screen == 'ac' }}"
+              sequence:
+                - action: script.tg_send
+                  data:
+                    edit_id: "{{ msg_id }}"
+                    chat: "{{ chat_id }}"
+                    keyboard:
+                      - "⏹ Выключить:/ac_off"
+                      - "❄️ Охлаждение:/ac_cool, ☀️ Обогрев:/ac_heat"
+                      - "➖ 1°:/ac_down, ➕ 1°:/ac_up"
+                      - "🔄 Обновить:/ac, ⬅️ Меню:/menu"
+                    message: |-
+                      {% set modes = {'off': 'выключен', 'cool': 'охлаждение', 'heat': 'обогрев', 'dry': 'осушение',
+                                      'fan_only': 'вентилятор', 'auto': 'авто'} %}
+                      {%- set t = state_attr(ac, 'temperature') | float(0) %}
+                      {%- set k = [[((t - 16) / 16 * 10) | round(0) | int, 0] | max, 10] | min %}
+                      ❄️ <b>Кондиционер</b> · гостиная
+                      {{ line }}
+                      {{ '🌑' if states(ac) in ['off', 'unavailable'] else ('🔵' if states(ac) == 'cool' else ('🔴' if states(ac) == 'heat' else '🟢')) }} Режим: <b>{{ modes.get(states(ac), states(ac)) }}</b>
+                      🎯 Уставка: <b>{{ state_attr(ac, 'temperature') }} °C</b>
+                      <code>16° {{ '▰' * k ~ '▱' * (10 - k) }} 32°</code>
+                      🌡 В комнате: <b>{{ state_attr(ac, 'current_temperature') }} °C</b>
+            - conditions: "{{ screen == 'floor' }}"
+              sequence:
+                - action: script.tg_send
+                  data:
+                    edit_id: "{{ msg_id }}"
+                    chat: "{{ chat_id }}"
+                    keyboard:
+                      - "▶️ Включить:/fl_on, ⏹ Выключить:/fl_off"
+                      - "➖ 1°:/fl_down, ➕ 1°:/fl_up"
+                      - "🔄 Обновить:/fl, ⬅️ Меню:/menu"
+                    message: |-
+                      {%- set t = state_attr(floor, 'temperature') | float(0) %}
+                      {%- set k = [[((t - 20) / 15 * 10) | round(0) | int, 0] | max, 10] | min %}
+                      🔥 <b>Тёплый пол</b> · кабинет
+                      {{ line }}
+                      {{ ('🔴 Включён, сейчас греет' if state_attr(floor, 'hvac_action') == 'heating' else '🟢 Включён, ждёт') if states(floor) == 'heat' else '🌑 Выключен' }}
+                      🌡 Датчик в стяжке: <b>{{ state_attr(floor, 'current_temperature') }} °C</b>
+                      🎯 Уставка: <b>{{ state_attr(floor, 'temperature') }} °C</b>
+                      <code>20° {{ '▰' * k ~ '▱' * (10 - k) }} 35°</code>
+                      {{ line }}
+                      <i>Ночью с 01:00 выключается сам, утром включается (будни 07:00, выходные 10:00).</i>
+            - conditions: "{{ screen == 'tv' }}"
+              sequence:
+                - action: script.tg_send
+                  data:
+                    edit_id: "{{ msg_id }}"
+                    chat: "{{ chat_id }}"
+                    keyboard:
+                      - "▶️ Включить:/tv_on, ⏹ Выключить:/tv_off"
+                      - "🖥 Компьютер:/tv_pc, 🏠 Домой:/tv_home"
+                      - "🔄 Обновить:/tv, ⬅️ Меню:/menu"
+                    message: |-
+                      📺 <b>Телевизор</b>
+                      {{ line }}
+                      {{ {'on': '🟢 Включён', 'off': '🌑 Выключен', 'playing': '🟢 Включён, играет', 'paused': '🟡 Включён, пауза',
+                          'idle': '🟢 Включён', 'unavailable': '🔴 Недоступен'}.get(states(tv), states(tv)) }}
+                      {%- if state_attr(tv, 'app_name') and states(tv) not in ['off', 'unavailable'] %}
+                      📱 {{ state_attr(tv, 'app_name') }}
+                      {%- endif %}
+            - conditions: "{{ screen == 'pc' }}"
+              sequence:
+                - action: script.tg_send
+                  data:
+                    edit_id: "{{ msg_id }}"
+                    chat: "{{ chat_id }}"
+                    keyboard:
+                      - "⚡ Включить компьютер:/pc_wake"
+                      - "🔄 Обновить:/pc, ⬅️ Меню:/menu"
+                    message: |-
+                      🖥 <b>Компьютер</b> · LLM
+                      {{ line }}
+                      {% if is_state('binary_sensor.kompiuter_llm_v_seti', 'on') %}🟢 Включён. LLM-бот работает на нём и сам запускает LM Studio.
+                      {%- else %}🌑 Спит или выключен.{% endif %}
+                      {%- if arg == 'wake' %}
+                      ⚡ Сигнал на включение отправлен — сообщу, когда компьютер проснётся.{% endif %}
+          default:
+            - action: script.tg_send
+              data:
+                edit_id: "{{ msg_id }}"
+                chat: "{{ chat_id }}"
+                keyboard: >-
+                  {{ ['💧 Вода:/water, 🌡 Температура:/temp', '💡 Свет:/lights, ❄️ Кондиционер:/ac']
+                     + (['🔥 Тёплый пол:/fl, 📺 Телевизор:/tv', '🖥 Компьютер:/pc'] if is_admin else ['📺 Телевизор:/tv']) }}
+                message: |-
+                  {%- set hr = now().hour %}
+                  {%- set greet = 'Доброе утро' if 5 <= hr < 12 else ('Добрый день' if 12 <= hr < 18 else ('Добрый вечер' if 18 <= hr < 23 else 'Доброй ночи')) %}
+                  {%- set w = states('weather.forecast_home_assistant') %}
+                  {%- set wi = {'sunny': '☀️', 'clear-night': '🌙', 'partlycloudy': '⛅', 'cloudy': '☁️', 'rainy': '🌧', 'pouring': '🌧',
+                                'snowy': '🌨', 'snowy-rainy': '🌨', 'fog': '🌫', 'hail': '🌨', 'lightning': '🌩',
+                                'lightning-rainy': '⛈', 'windy': '💨', 'windy-variant': '💨', 'exceptional': '⚠️'} %}
+                  {%- set wn = {'sunny': 'ясно', 'clear-night': 'ясно', 'partlycloudy': 'переменная облачность', 'cloudy': 'облачно',
+                                'rainy': 'дождь', 'pouring': 'ливень', 'snowy': 'снег', 'snowy-rainy': 'мокрый снег', 'fog': 'туман',
+                                'hail': 'град', 'lightning': 'гроза', 'lightning-rainy': 'гроза', 'windy': 'ветрено',
+                                'windy-variant': 'ветрено', 'exceptional': 'непогода'} %}
+                  {%- set on = lights | selectattr(0, 'is_state', 'on') | map(attribute=1) | list %}
+                  {%- set temps = rooms | map(attribute=1) | map('states') | select('is_number') | map('float') | list %}
+                  {%- set hums = rooms | map(attribute=2) | select('string') | map('states') | select('is_number') | map('float') | list %}
+                  {%- set modes = {'cool': 'охлаждение', 'heat': 'обогрев', 'dry': 'осушение', 'fan_only': 'вентилятор', 'auto': 'авто', 'heat_cool': 'авто'} %}
+                  {#- тревоги: протечка — всем, служебное — только админу #}
+                  {%- set ns = namespace(alerts=[]) %}
+                  {%- for s in ['binary_sensor.datchik_utechki_ekf_water_leak', 'binary_sensor.datchik_protechki_water_leak'] if is_state(s, 'on') %}
+                    {%- set ns.alerts = ns.alerts + ['🚨 <b>Протечка:</b> ' ~ state_attr(s, 'friendly_name')] %}
+                  {%- endfor %}
+                  {%- if is_admin %}
+                    {%- if is_state('binary_sensor.voda_kholodnaia_podozritelnyi_raskhod', 'on') or is_state('binary_sensor.voda_goriachaia_podozritelnyi_raskhod', 'on') %}
+                      {%- set ns.alerts = ns.alerts + ['⚠️ Подозрительный расход воды'] %}
+                    {%- endif %}
+                    {%- if is_state('binary_sensor.zigbee2mqtt_bridge_connection_state', 'off') %}
+                      {%- set ns.alerts = ns.alerts + ['⚠️ Zigbee2MQTT не на связи'] %}
+                    {%- endif %}
+                    {%- set low = states.sensor | selectattr('attributes.device_class', 'defined') | selectattr('attributes.device_class', 'eq', 'battery')
+                                  | rejectattr('entity_id', 'search', 'iphone|sm_a525f') | map(attribute='state') | select('is_number') | map('float')
+                                  | select('lt', 15) | list | count %}
+                    {%- if low %}{% set ns.alerts = ns.alerts + ['🔋 Сели батарейки: ' ~ low ~ ' шт. (придёт список в 19:00)'] %}{% endif %}
+                  {%- endif %}
+                  🏠 <b>Умный дом</b>
+                  {{ greet }}! {{ wi.get(w, '🌡') }} На улице <b>{{ states('sensor.temperatura_na_ulitse') }} °C</b>, {{ wn.get(w, w) }}
+                  {{ line }}
+                  {%- for a in ns.alerts %}
+                  {{ a }}
+                  {%- endfor %}
+                  {%- if ns.alerts %}
+                  {{ line }}
+                  {%- endif %}
+                  💡 Свет: {{ '<b>' ~ on | join(', ') ~ '</b>' if on else 'всё выключено' }}
+                  ❄️ Кондиционер: {{ '🌑 выключен' if states(ac) in ['off', 'unavailable', 'unknown'] else '🟢 ' ~ modes.get(states(ac), states(ac)) ~ ', ' ~ state_attr(ac, 'temperature') ~ ' °C' }}
+                  📺 Телевизор: {{ '🌑 выключен' if states(tv) in ['off', 'unavailable', 'unknown', 'standby'] else '🟢 включён' }}
+                  {%- if is_admin %}
+                  🔥 Тёплый пол: {{ ('🔴 греет' if state_attr(floor, 'hvac_action') == 'heating' else '🟢 включён') ~ ', ' ~ state_attr(floor, 'current_temperature') ~ ' °C' if states(floor) == 'heat' else '🌑 выключен' }}
+                  🖥 Компьютер: {{ '🟢 в сети' if is_state('binary_sensor.kompiuter_llm_v_seti', 'on') else '🌑 спит' }}
+                  {%- endif %}
+                  💧 Вода сегодня: 🔵 {{ states('sensor.kholodnaia_voda_za_segodnia') | float(0) | round(3) }} · 🔴 {{ states('sensor.goriachaia_voda_za_segodnia') | float(0) | round(3) }} м³
+                  {%- if temps %}
+                  🌡 Дома: <b>{{ temps | min | round(1) }}–{{ temps | max | round(1) }} °C</b>{{ ', влажность ' ~ (hums | sum / hums | count) | round(0) | int ~ ' %' if hums }}
+                  {%- endif %}
+                  {{ line }}
+                  Выберите раздел:
+
+    # Напоминания: их создаёт LLM-бот на большом ПК (MCP-сервер reminders → calendar.napominaniia),
+    # а присылает этот бот — Orange Pi включён всегда, поэтому напоминание приходит, даже когда ПК спит.
+    - id: tg_reminder
+      alias: "Telegram: напоминание из календаря"
+      mode: queued
+      max: 20
+      triggers:
+        - trigger: calendar
+          event: start
+          offset: "0:0:0"
+          entity_id: calendar.napominaniia
+      actions:
+        - action: script.tg_send
+          data:
+            message: |-
+              ⏰ <b>Напоминание</b>
+              {{ trigger.calendar_event.summary | e }}{% if trigger.calendar_event.description %}
+
+              {{ trigger.calendar_event.description | e }}{% endif %}
+            keyboard:
+              - "✅ Сделано:/rem_done"
+              - "⏰ +10 мин:/rem_snooze10, ⏰ +1 час:/rem_snooze60"
+
+    # Календарный триггер читает календарь раз в 15 минут и не видит события, созданные после этого
+    # (например, «отложить на 10 минут»). Календарь меняет атрибуты при добавлении или удалении
+    # события, не меняя состояния, — тогда перезапускаем tg_reminder, и он сразу перечитывает календарь.
+    # Смену off↔on (начало и конец события) пропускаем, чтобы не помешать срабатыванию.
+    - id: tg_reminder_refresh
+      alias: "Telegram: перечитать календарь напоминаний"
+      mode: restart
+      triggers:
+        - trigger: state
+          entity_id: calendar.napominaniia
+      conditions:
+        - "{{ trigger.from_state is not none and trigger.to_state is not none
+              and trigger.from_state.state == trigger.to_state.state }}"
+      actions:
+        - action: automation.turn_off
+          target: { entity_id: automation.telegram_napominanie_iz_kalendaria }
+          data: { stop_actions: false }
+        - action: automation.turn_on
+          target: { entity_id: automation.telegram_napominanie_iz_kalendaria }
+
+    - id: tg_alerts
+      alias: "Telegram: уведомления"
+      mode: queued
+      triggers:
+        - trigger: state
+          entity_id:
+            - binary_sensor.datchik_utechki_ekf_water_leak
+            - binary_sensor.datchik_protechki_water_leak
+          to: "on"
+          id: leak
+        - trigger: state
+          entity_id:
+            - binary_sensor.voda_kholodnaia_podozritelnyi_raskhod
+            - binary_sensor.voda_goriachaia_podozritelnyi_raskhod
+          to: "on"
+          id: water
+        - trigger: state
+          entity_id: binary_sensor.zigbee2mqtt_bridge_connection_state
+          to: "off"
+          for: "00:05:00"
+          id: zigbee_off
+        - trigger: state
+          entity_id: binary_sensor.zigbee2mqtt_bridge_connection_state
+          from: "off"
+          to: "on"
+          id: zigbee_on
+        - trigger: time
+          at: "19:00:00"
+          id: battery
+      actions:
+        - choose:
+            # Протечка — всем; остальное — только админу (tg_send по умолчанию шлёт админу)
+            - conditions: "{{ trigger.id == 'leak' }}"
+              sequence:
+                - repeat:
+                    for_each: &tg_all_chats [!secret tg_chat_id, !secret tg_chat_id_2]
+                    sequence:
+                      - action: script.turn_on
+                        target:
+                          entity_id: script.tg_send
+                        data:
+                          variables:
+                            chat: "{{ repeat.item }}"
+                            message: "🚨 <b>ПРОТЕЧКА!</b> Сработал «{{ trigger.to_state.name }}». Проверьте и перекройте воду."
+            - conditions: "{{ trigger.id == 'water' }}"
+              sequence:
+                - action: script.tg_send
+                  data:
+                    message: "⚠️ Saures заметил подозрительный расход воды ({{ trigger.to_state.name }}). Возможно, где-то течёт или открыт кран."
+            - conditions: "{{ trigger.id == 'zigbee_off' }}"
+              sequence:
+                - action: script.tg_send
+                  data:
+                    message: "⚠️ Zigbee2MQTT не на связи уже 5 минут. Сторож попробует перезапустить его сам."
+            - conditions: "{{ trigger.id == 'zigbee_on' }}"
+              sequence:
+                - action: script.tg_send
+                  data:
+                    message: "✅ Zigbee2MQTT снова на связи."
+            - conditions: "{{ trigger.id == 'battery' }}"
+              sequence:
+                - variables:
+                    list: >-
+                      {% set ns = namespace(out=[]) %}
+                      {% for s in states.sensor if s.attributes.device_class is defined and s.attributes.device_class == 'battery'
+                         and 'iphone' not in s.entity_id and 'sm_a525f' not in s.entity_id and s.state | is_number and s.state | float < 15 %}
+                        {% set ns.out = ns.out + [s.name ~ ' — ' ~ s.state ~ ' %'] %}
+                      {% endfor %}
+                      {{ ns.out }}
+                - if: "{{ list | length > 0 }}"
+                  then:
+                    - action: script.tg_send
+                      data:
+                        message: "🔋 Пора заменить батарейки:\n{{ list | join('\n') }}"
+
+    - id: tg_water_reminder
+      alias: "Telegram: напоминание передать показания воды"
+      mode: single
+      triggers:
+        - trigger: time
+          at: "10:00:00"
+      conditions:
+        - condition: template
+          value_template: "{{ now().day == 20 }}"
+      actions:
+        - variables:
+            cold: "{{ states('sensor.voda_kholodnaia') }}"
+            hot: "{{ states('sensor.voda_goriachaia') }}"
+        - repeat:
+            for_each: *tg_all_chats
+            sequence:
+              - action: script.tg_api_call
+                data:
+                  method: sendMessage
+                  body:
+                    chat_id: "{{ repeat.item }}"
+                    parse_mode: HTML
+                    text: |-
+                      📅 <b>Пора передать показания воды</b>
+
+                      🔵 <b>Холодная</b>, м³:
+                      👉 <code>{{ cold }}</code>
+                      🔴 <b>Горячая</b>, м³:
+                      👉 <code>{{ hot }}</code>
+                      За месяц: холодной {{ states('sensor.kholodnaia_voda_za_mesiats') | float(0) | round(3) }} м³, горячей {{ states('sensor.goriachaia_voda_za_mesiats') | float(0) | round(3) }} м³.
+                      Контроллер передал данные: {{ (state_attr('sensor.saures_kontroller', 'readout_dt') or '—') | replace('T', ' ') }}
+
+                      📋 Нажмите на число или на кнопку ниже — показание скопируется.
+                    reply_markup:
+                      inline_keyboard:
+                        - - text: "📋 Холодная {{ cold }}"
+                            copy_text: { text: "{{ cold }}" }
+                          - text: "📋 Горячая {{ hot }}"
+                            copy_text: { text: "{{ hot }}" }
+                        - - { text: "💧 Открыть раздел «Вода»", callback_data: "/water" }
+              # и картинку с расходом по дням
+              - action: script.turn_on
+                target:
+                  entity_id: script.tg_chart
+                data:
+                  variables:
+                    kind: water
+                    chat: "{{ repeat.item }}"
+
+    # Сторож приёма команд. Отправка может работать, а приём (long polling) молча зависнуть
+    # после обрыва у провайдера — так было с 04.10 по 18.10. Telegram отдаёт число сообщений,
+    # которые бот ещё не забрал (pending_update_count). Живой бот забирает их за секунды;
+    # если они висят и через 90 с — переподключаем бота. Проверка раз в 10 минут, чтобы
+    # зависшие команды не выполнились с большим опозданием.
+    - id: tg_watchdog
+      alias: "Telegram: сторож приёма команд"
+      mode: single
+      triggers:
+        - trigger: time_pattern
+          minutes: "/10"
+      actions:
+        - action: rest_command.tg_api
+          data:
+            method: getWebhookInfo
+            body: "{}"
+          response_variable: r1
+          continue_on_error: true
+        - condition: template
+          value_template: >-
+            {{ r1 is defined and r1.status | default(0) == 200
+               and r1.content.result.pending_update_count | default(0) | int(0) > 0 }}
+        - delay: 90
+        - action: rest_command.tg_api
+          data:
+            method: getWebhookInfo
+            body: "{}"
+          response_variable: r2
+          continue_on_error: true
+        - condition: template
+          value_template: >-
+            {{ r2 is defined and r2.status | default(0) == 200
+               and r2.content.result.pending_update_count | default(0) | int(0) > 0 }}
+        - action: logbook.log
+          data:
+            name: "Telegram-бот"
+            message: >-
+              приём команд завис ({{ r2.content.result.pending_update_count }} сообщ. ждут) — переподключаю
+            domain: telegram_bot
+        - action: homeassistant.reload_config_entry
+          data:
+            entry_id: 01JZNXAFGDD3H9QZR3PPZBJ6R0
